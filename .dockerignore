@@ -1,0 +1,15 @@
+gemini/
+完成圖檔區/
+zip儲存區/
+.state/
+config.json
+__pycache__/
+*.pyc
+analysis_log.txt
+_tmp_*
+preview_*/
+line_store_*/
+*.md
+google 相關/
+新資料夾/
+文案整理/
