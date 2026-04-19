@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets & runtime config
+config.json
+.env
+.env.*
+*.key
+*.pem
+KEY
+
+# Runtime output / local state
+data/
+.state/
+完成圖檔區/
+zip儲存區/
+preview_*/
+preview_cells_*/
+站存/
+尚未使用貼圖/
+gemini/
+google 相關/
+新資料夾/
+參考資料/
+角色三視圖/
+
+# Scraping / analysis artifacts (not needed for deploy)
+line_store_analysis/
+line_store_screenshots/
+analysis_log.txt
+copywriting_compact.json
+copywriting_data.json
+_tmp_*.json
+line_sticker_analysis_n8n.json
+line_sticker_generate_n8n.json
+
+# One-off scripts (local tooling)
+debug_urls.py
+test_gemini_single.py
+list_models.py
+analyze_stickers_gemini.py
+build_n8n_workflow.py
+n8n_sticker_sender.py
+scrape_line_popular.py
+scrape_line_store.py
+scrape_sticker_detail.py
+preview_crop.py
+preview_crop_otter_love.py
+
+# Old loose notes (文案整理/ 是 source of truth)
+貼圖文案_新增類別組.md
+貼圖文案紀錄.md

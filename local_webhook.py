@@ -1,197 +1,205 @@
 """
-LINE 貼圖本機 Webhook Listener (streaming + Telegram 審核版)
+LINE 貼圖後端服務（Supabase 版）
+
+所有真實狀態 → Supabase DB + Storage。
+相比舊版移除了本機 .state/、gemini/、完成圖檔區/、zip儲存區/ 的依賴
+（仍會用 /tmp 作為 make_stickers.py 的工作目錄）。
 
 啟動方式：
-  pip install fastapi uvicorn httpx
+  pip install -r requirements.txt
   python local_webhook.py [--port 5000]
 
-環境變數 / config.json：
-  TG_BOT_TOKEN   Telegram bot token
-  TG_CHAT_ID     Telegram chat id
-  PUBLIC_URL     對外公開的 URL（ngrok 或正式 domain），用來產生審核頁連結
+必填環境變數 / config.json 欄位：
+  SUPABASE_URL              e.g. https://xxx.supabase.co
+  SUPABASE_SERVICE_KEY      service_role key（繞過 RLS）
+  SUPABASE_JWT_SECRET       驗證前端送來的 access token
+
+選填：
+  N8N_WEBHOOK_URL           前端建立 job 後，觸發 N8N 的 webhook
+  N8N_SHARED_SECRET         N8N 回呼 /jobs/{id}/sheet 要帶的 header secret
+  INTERNAL_CLEANUP_TOKEN    pg_cron 呼叫 /internal/cleanup 的 bearer token
+  PUBLIC_URL                對外公開 URL（僅用於日誌顯示）
 
 端點：
-  POST /sheet              N8N 每張原稿生完就 POST 過來（streaming，避免 OOM）
-  GET  /preview/<name>     瀏覽器開這個網址審核 6 張原稿
-  POST /finalize/<name>    審核通過 → 呼叫 make_stickers.py 裁切 + 打包
-  POST /reject/<name>      審核退回 → 清除狀態
-  GET  /image/<name>/<n>   取得單張原稿（給 preview 頁用）
-  POST /process            （舊端點，向下相容，一次收全部再處理）
+  健康檢查
+    GET  /health
+
+  前端（需帶 Authorization: Bearer <supabase_access_token>）
+    POST /jobs                    建立 job（multipart：參考圖 + json 欄位）
+    GET  /jobs                    列出我的 jobs
+    GET  /jobs/{id}               查詢 job 詳情（含 sheet signed URLs）
+    POST /jobs/{id}/finalize      確認裁切
+    POST /jobs/{id}/reject        拒絕重生
+    GET  /jobs/{id}/zip           取得 ZIP signed URL
+
+  N8N 回呼（X-Webhook-Secret header）
+    POST /jobs/{id}/sheet         上傳單張 sheet 原稿
+
+  內部維護（Authorization: Bearer <INTERNAL_CLEANUP_TOKEN>）
+    POST /internal/cleanup        清過期 job 的 Storage 檔案
 """
 
 import argparse
 import base64
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import List, Optional
+from uuid import UUID
 
 import httpx
+import jwt
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi import (
+    BackgroundTasks, Depends, FastAPI, File, Form, Header,
+    HTTPException, UploadFile, status,
+)
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from supabase import create_client, Client
 
 # ============================================================
 # 設定
 # ============================================================
 
 BASE_DIR = Path(__file__).parent
-DATA_DIR = Path(os.environ.get("DATA_DIR") or str(BASE_DIR))
-GEMINI_DIR = DATA_DIR / "gemini"
-STATE_DIR = DATA_DIR / ".state"
-ZIP_PARENT = DATA_DIR / "zip儲存區"
-OUT_PARENT = DATA_DIR / "完成圖檔區"
 MAKE_STICKERS = BASE_DIR / "make_stickers.py"
 CONFIG_FILE = BASE_DIR / "config.json"
 
+STORAGE_BUCKET = "sticker-assets"
+SIGNED_URL_TTL_PREVIEW = 3600        # 1 hour
+SIGNED_URL_TTL_DOWNLOAD = 300        # 5 min
+
+
 def load_config():
-    cfg = {
-        "TG_BOT_TOKEN": os.environ.get("TG_BOT_TOKEN", ""),
-        "TG_CHAT_ID": os.environ.get("TG_CHAT_ID", ""),
-        "PUBLIC_URL": os.environ.get("PUBLIC_URL", ""),
-    }
+    keys = [
+        "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_JWT_SECRET",
+        "N8N_WEBHOOK_URL", "N8N_SHARED_SECRET", "INTERNAL_CLEANUP_TOKEN",
+        "PUBLIC_URL",
+    ]
+    cfg = {k: os.environ.get(k, "") for k in keys}
     if CONFIG_FILE.exists():
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            for k in cfg:
-                if data.get(k):
+            for k in keys:
+                if not cfg[k] and data.get(k):
                     cfg[k] = str(data[k])
         except Exception as e:
             print(f"  警告：讀取 config.json 失敗：{e}")
     return cfg
 
+
 CONFIG = load_config()
 
-app = FastAPI(title="LINE 貼圖本機處理服務")
+required = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_JWT_SECRET"]
+missing = [k for k in required if not CONFIG.get(k)]
+if missing:
+    print(f"  警告：缺少必填設定 {missing}，Supabase 相關端點將無法運作", file=sys.stderr)
+
+sb: Optional[Client] = None
+if CONFIG.get("SUPABASE_URL") and CONFIG.get("SUPABASE_SERVICE_KEY"):
+    sb = create_client(CONFIG["SUPABASE_URL"], CONFIG["SUPABASE_SERVICE_KEY"])
+
+
+app = FastAPI(title="LINE 貼圖後端服務（Supabase）")
+
 
 # ============================================================
-# Telegram
+# Auth
 # ============================================================
 
-def send_telegram(text: str, disable_web_page_preview: bool = False):
-    token = CONFIG.get("TG_BOT_TOKEN")
-    chat_id = CONFIG.get("TG_CHAT_ID")
-    if not token or not chat_id:
-        print(f"  [Telegram 略過]（缺 TG_BOT_TOKEN 或 TG_CHAT_ID）：{text}")
-        return False
+def require_user(authorization: Optional[str] = Header(None)) -> str:
+    """驗證 Supabase access token，回傳 user_id (sub)"""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    secret = CONFIG.get("SUPABASE_JWT_SECRET")
+    if not secret:
+        raise HTTPException(500, "Server missing SUPABASE_JWT_SECRET")
     try:
-        r = httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": int(chat_id),
-                "text": text,
-                "disable_web_page_preview": disable_web_page_preview,
-            },
-            timeout=15,
+        payload = jwt.decode(
+            token, secret,
+            algorithms=["HS256"],
+            audience="authenticated",
         )
-        ok = r.json().get("ok", False)
-        if not ok:
-            print(f"  Telegram 發送失敗：{r.text}")
-        else:
-            print(f"  Telegram 已送出")
-        return ok
-    except Exception as e:
-        print(f"  Telegram 發送例外：{e}")
-        return False
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(401, f"Invalid token: {e}")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(401, "Token missing sub")
+    return user_id
+
+
+def require_n8n_secret(x_webhook_secret: Optional[str] = Header(None)):
+    expected = CONFIG.get("N8N_SHARED_SECRET")
+    if not expected:
+        # 未設定 secret → 警告但放行（開發方便；上線務必設定）
+        return
+    if x_webhook_secret != expected:
+        raise HTTPException(401, "Invalid webhook secret")
+
+
+def require_internal_token(authorization: Optional[str] = Header(None)):
+    expected = CONFIG.get("INTERNAL_CLEANUP_TOKEN")
+    if not expected:
+        raise HTTPException(500, "Server missing INTERNAL_CLEANUP_TOKEN")
+    if not authorization or authorization != f"Bearer {expected}":
+        raise HTTPException(401, "Invalid internal token")
+
 
 # ============================================================
-# 狀態管理（per set_name）
+# Supabase helper
 # ============================================================
 
-def state_path(set_name: str) -> Path:
-    STATE_DIR.mkdir(exist_ok=True)
-    return STATE_DIR / f"{set_name}.json"
+def _ensure_sb() -> Client:
+    if sb is None:
+        raise HTTPException(503, "Supabase client not configured")
+    return sb
 
-def load_state(set_name: str) -> Optional[dict]:
-    p = state_path(set_name)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
-def save_state(set_name: str, state: dict):
-    state_path(set_name).write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+def _storage_upload(path: str, data: bytes, content_type: str):
+    _ensure_sb().storage.from_(STORAGE_BUCKET).upload(
+        path, data,
+        file_options={"content-type": content_type, "upsert": "true"},
     )
 
+
+def _storage_download(path: str) -> bytes:
+    return _ensure_sb().storage.from_(STORAGE_BUCKET).download(path)
+
+
+def _storage_remove(paths: List[str]):
+    if paths:
+        _ensure_sb().storage.from_(STORAGE_BUCKET).remove(paths)
+
+
+def _signed_url(path: str, ttl: int) -> str:
+    resp = _ensure_sb().storage.from_(STORAGE_BUCKET).create_signed_url(path, ttl)
+    return resp.get("signedURL") or resp.get("signed_url") or ""
+
+
 # ============================================================
-# 資料模型
+# Models
 # ============================================================
+
+class JobCreateResp(BaseModel):
+    job_id: str
+    status: str
+
 
 class SheetUpload(BaseModel):
-    set_name: str
+    image_b64: str
     sheet_number: int
     total_sheets: int
-    total: int = 40
-    image_b64: str
-    main_src: Optional[List[int]] = None
-    tab_src: Optional[List[int]] = None
-    model: Optional[str] = None
 
-class SheetData(BaseModel):
-    number: int
-    image_b64: str
-
-class ProcessRequest(BaseModel):
-    set_name: str
-    total: int = 40
-    sheets: List[SheetData]
-    main_src: List[int] = [5, 0]
-    tab_src: List[int] = [5, 1]
-    callback_url: Optional[str] = None
-
-# ============================================================
-# 核心：裁切 + Telegram 完成通知
-# ============================================================
-
-def run_make_stickers(set_name: str, total: int, sheet_filenames: List[str],
-                      main_src: List[int], tab_src: List[int]) -> dict:
-    sheets_arg = ",".join(sheet_filenames)
-    main_arg = f"{main_src[0]},{main_src[1]}"
-    tab_arg = f"{tab_src[0]},{tab_src[1]}"
-
-    cmd = [
-        sys.executable, str(MAKE_STICKERS),
-        "--name", set_name,
-        "--total", str(total),
-        "--sheets", sheets_arg,
-        "--main", main_arg,
-        "--tab", tab_arg,
-    ]
-    print(f"\n=== 執行裁切：{' '.join(cmd)} ===")
-
-    env = os.environ.copy()
-    env["DATA_DIR"] = str(DATA_DIR)
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(BASE_DIR), env=env)
-    if result.returncode != 0:
-        raise HTTPException(status_code=500, detail={
-            "error": "make_stickers.py 執行失敗",
-            "stderr": result.stderr,
-            "stdout": result.stdout,
-        })
-
-    print(result.stdout)
-    out_dir = OUT_PARENT / set_name
-    zip_path = ZIP_PARENT / f"{set_name}.zip"
-    files = sorted(f.name for f in out_dir.glob("*.png")) if out_dir.exists() else []
-
-    return {
-        "status": "success",
-        "set_name": set_name,
-        "total": total,
-        "output_dir": str(out_dir),
-        "zip_path": str(zip_path),
-        "zip_exists": zip_path.exists(),
-        "files": files,
-        "stdout": result.stdout,
-    }
 
 # ============================================================
 # 端點
@@ -201,285 +209,361 @@ def run_make_stickers(set_name: str, total: int, sheet_filenames: List[str],
 def health():
     return {
         "status": "ok",
-        "telegram_configured": bool(CONFIG.get("TG_BOT_TOKEN") and CONFIG.get("TG_CHAT_ID")),
+        "supabase_configured": sb is not None,
+        "n8n_webhook_set": bool(CONFIG.get("N8N_WEBHOOK_URL")),
+        "n8n_secret_set": bool(CONFIG.get("N8N_SHARED_SECRET")),
         "public_url": CONFIG.get("PUBLIC_URL") or "(未設定)",
     }
 
-@app.post("/sheet")
-def receive_sheet(req: SheetUpload):
-    """N8N 每張原稿生完就 POST 一次，最後一張收齊時發 Telegram 審核通知"""
-    GEMINI_DIR.mkdir(exist_ok=True)
 
-    # 第 1 張來時重置 state（避免舊資料污染）
-    state = load_state(req.set_name)
-    if req.sheet_number == 1 or state is None:
-        state = {
-            "set_name": req.set_name,
-            "total_sheets": req.total_sheets,
-            "total": req.total,
-            "main_src": req.main_src or [req.total_sheets - 1, 0],
-            "tab_src": req.tab_src or [req.total_sheets - 1, 1],
-            "model": req.model or "",
-            "sheets_received": [],
-            "sheet_filenames": {},
-            "status": "receiving",
-            "created_at": time.time(),
-        }
+# ---------- 前端：建立 job ----------
 
-    filename = f"{req.set_name}_sheet{req.sheet_number}.png"
-    filepath = GEMINI_DIR / filename
-    filepath.write_bytes(base64.b64decode(req.image_b64))
-    print(f"  收到 {req.set_name} sheet {req.sheet_number}/{req.total_sheets}（{filepath.stat().st_size} bytes）")
+@app.post("/jobs", response_model=JobCreateResp)
+async def create_job(
+    background: BackgroundTasks,
+    user_id: str = Depends(require_user),
+    set_name: str = Form(...),
+    character_name: str = Form(""),
+    character_prompt: str = Form(""),
+    series_id: str = Form(...),
+    total: int = Form(40),
+    model: str = Form("flash"),
+    reference_image: UploadFile = File(...),
+):
+    client = _ensure_sb()
 
-    if req.sheet_number not in state["sheets_received"]:
-        state["sheets_received"].append(req.sheet_number)
-    state["sheet_filenames"][str(req.sheet_number)] = filename
+    # 上傳參考圖 → Storage（此時 job_id 未知，用 tmp 路徑後再搬）
+    ref_bytes = await reference_image.read()
+    if not ref_bytes:
+        raise HTTPException(400, "reference_image is empty")
 
-    if len(state["sheets_received"]) >= state["total_sheets"]:
-        state["status"] = "awaiting_review"
-        save_state(req.set_name, state)
+    # 先建 job 取得 id
+    ins = client.table("jobs").insert({
+        "user_id": user_id,
+        "set_name": set_name,
+        "character_name": character_name or None,
+        "character_prompt": character_prompt or None,
+        "series_id": series_id,
+        "total": total,
+        "model": model,
+        "status": "pending",
+    }).execute()
+    job = ins.data[0]
+    job_id = job["id"]
 
-        public = CONFIG.get("PUBLIC_URL") or "http://localhost:5000"
-        preview_url = f"{public}/preview/{req.set_name}"
-        send_telegram(
-            f"貼圖「{req.set_name}」生圖完成（共 {state['total_sheets']} 張原稿）\n\n"
-            f"開啟審核頁：\n{preview_url}"
-        )
-    else:
-        save_state(req.set_name, state)
+    # 上傳參考圖到正式路徑
+    ref_path = f"{user_id}/{job_id}/reference.png"
+    _storage_upload(ref_path, ref_bytes, reference_image.content_type or "image/png")
+    client.table("jobs").update({
+        "reference_image_path": ref_path,
+        "status": "generating",
+    }).eq("id", job_id).execute()
 
-    return {
-        "status": "ok",
-        "received": len(state["sheets_received"]),
-        "total_sheets": state["total_sheets"],
-        "all_received": state["status"] == "awaiting_review",
+    # 背景觸發 N8N
+    background.add_task(_trigger_n8n, job_id, user_id)
+
+    return JobCreateResp(job_id=job_id, status="generating")
+
+
+def _trigger_n8n(job_id: str, user_id: str):
+    url = CONFIG.get("N8N_WEBHOOK_URL")
+    if not url:
+        print(f"  [N8N 未設定] job={job_id} 建立完成但未觸發 N8N")
+        return
+    client = _ensure_sb()
+    # 讀 job 完整資料
+    job = client.table("jobs").select("*").eq("id", job_id).single().execute().data
+    series = client.table("series").select("*").eq("id", job["series_id"]).single().execute().data
+
+    # 參考圖 signed URL
+    ref_url = _signed_url(job["reference_image_path"], SIGNED_URL_TTL_PREVIEW)
+
+    payload = {
+        "job_id": job_id,
+        "user_id": user_id,
+        "set_name": job["set_name"],
+        "character_name": job["character_name"],
+        "character_prompt": job["character_prompt"],
+        "series_id": job["series_id"],
+        "series_name": series["name"] if series else "",
+        "series_items": (series["items"] if series else []),
+        "total": job["total"],
+        "model": job["model"],
+        "reference_image_url": ref_url,
+        "callback_url": f"{CONFIG.get('PUBLIC_URL','').rstrip('/')}/jobs/{job_id}/sheet",
     }
+    try:
+        r = httpx.post(url, json=payload, timeout=30)
+        print(f"  觸發 N8N：{r.status_code}")
+        if r.status_code >= 400:
+            print(f"  N8N 回應：{r.text[:300]}")
+    except Exception as e:
+        print(f"  觸發 N8N 失敗：{e}")
+        client.table("jobs").update({"status": "failed", "error": f"n8n trigger: {e}"}).eq("id", job_id).execute()
 
-@app.get("/image/{set_name}/{sheet_number}")
-def get_image(set_name: str, sheet_number: int):
-    state = load_state(set_name)
-    if not state:
-        raise HTTPException(404, "Set not found")
-    filename = state["sheet_filenames"].get(str(sheet_number))
-    if not filename:
-        raise HTTPException(404, f"Sheet {sheet_number} not found")
-    path = GEMINI_DIR / filename
-    if not path.exists():
-        raise HTTPException(404, "File missing")
-    return FileResponse(path, media_type="image/png")
 
-@app.get("/preview/{set_name}", response_class=HTMLResponse)
-def preview(set_name: str):
-    state = load_state(set_name)
-    if not state:
-        raise HTTPException(404, "Set not found")
+# ---------- 前端：列出 / 查詢 ----------
 
-    sheets_html = ""
-    for n in sorted(state["sheets_received"]):
-        sheets_html += f"""
-        <div class="sheet">
-          <div class="sheet-title">Sheet {n}</div>
-          <img src="/image/{set_name}/{n}" alt="sheet {n}" loading="lazy">
-        </div>
-        """
+@app.get("/jobs")
+def list_jobs(user_id: str = Depends(require_user)):
+    client = _ensure_sb()
+    rows = (
+        client.table("jobs")
+        .select("id,set_name,series_id,total,model,status,created_at,expires_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute().data
+    )
+    return {"jobs": rows}
 
-    status = state.get("status", "receiving")
-    status_label = {
-        "receiving": "收圖中",
-        "awaiting_review": "待審核",
-        "finalized": "已完成",
-    }.get(status, status)
 
-    html = f"""<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{set_name} 原稿審核</title>
-<style>
-  * {{ box-sizing: border-box; }}
-  body {{ font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-         margin: 0; padding: 20px; background: #111; color: #eee; }}
-  h1 {{ margin: 0 0 8px; font-size: 22px; }}
-  .meta {{ color: #999; font-size: 14px; margin-bottom: 16px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }}
-  .sheet {{ background: #1c1c1c; border-radius: 8px; overflow: hidden; padding: 8px; }}
-  .sheet-title {{ font-size: 13px; color: #aaa; margin-bottom: 6px; }}
-  .sheet img {{ width: 100%; display: block; border-radius: 4px; background: #00ff00; }}
-  .actions {{ position: sticky; bottom: 0; padding: 16px 0 0;
-             background: linear-gradient(to bottom, transparent, #111 40%); margin-top: 16px; }}
-  button {{ font-size: 16px; padding: 14px 24px; border-radius: 8px; border: none;
-            cursor: pointer; margin-right: 10px; font-weight: 600; }}
-  .confirm {{ background: #27c36a; color: white; }}
-  .reject {{ background: #555; color: white; }}
-  .confirm:disabled {{ background: #666; cursor: not-allowed; }}
-  #status {{ margin-top: 14px; padding: 12px; border-radius: 6px; background: #222; display: none; }}
-  #status.show {{ display: block; }}
-  #status.ok {{ background: #0f3; color: #000; }}
-  #status.err {{ background: #c33; color: white; }}
-</style>
-</head>
-<body>
-  <h1>{set_name}</h1>
-  <div class="meta">狀態：{status_label}　/　原稿：{len(state['sheets_received'])}/{state['total_sheets']}　/　最終貼圖：{state['total']} 張　/　模型：{state.get('model') or '未知'}</div>
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str, user_id: str = Depends(require_user)):
+    client = _ensure_sb()
+    job = _get_my_job(client, job_id, user_id)
 
-  <div class="grid">{sheets_html}</div>
-
-  <div class="actions">
-    <button class="confirm" id="confirmBtn" onclick="confirmCrop()">確認裁切 + 打包</button>
-    <button class="reject" onclick="rejectSet()">退回（清除這套）</button>
-    <div id="status"></div>
-  </div>
-
-<script>
-const setName = {json.dumps(set_name)};
-const statusBox = document.getElementById('status');
-const btn = document.getElementById('confirmBtn');
-
-function show(msg, cls) {{
-  statusBox.className = 'show ' + (cls || '');
-  statusBox.textContent = msg;
-}}
-
-async function confirmCrop() {{
-  btn.disabled = true;
-  show('裁切中… 40 張約需 30 秒');
-  try {{
-    const r = await fetch(`/finalize/${{encodeURIComponent(setName)}}`, {{ method: 'POST' }});
-    const data = await r.json();
-    if (r.ok) {{
-      show(`完成！ZIP: ${{data.zip_path}}　共 ${{data.files.length}} 個檔案`, 'ok');
-    }} else {{
-      show('失敗：' + JSON.stringify(data), 'err');
-      btn.disabled = false;
-    }}
-  }} catch (e) {{
-    show('錯誤：' + e.message, 'err');
-    btn.disabled = false;
-  }}
-}}
-
-async function rejectSet() {{
-  if (!confirm('確定要退回？會清除這套的原稿與狀態。')) return;
-  try {{
-    const r = await fetch(`/reject/${{encodeURIComponent(setName)}}`, {{ method: 'POST' }});
-    const data = await r.json();
-    show('已退回：' + JSON.stringify(data));
-  }} catch (e) {{
-    show('錯誤：' + e.message, 'err');
-  }}
-}}
-</script>
-</body>
-</html>"""
-    return HTMLResponse(html)
-
-@app.post("/finalize/{set_name}")
-def finalize(set_name: str):
-    state = load_state(set_name)
-    if not state:
-        raise HTTPException(404, "Set not found")
-    if len(state["sheets_received"]) < state["total_sheets"]:
-        raise HTTPException(400, f"尚未收齊原稿（{len(state['sheets_received'])}/{state['total_sheets']}）")
-
-    sheet_filenames = [
-        state["sheet_filenames"][str(n)]
-        for n in sorted(state["sheets_received"])
+    sheets = (
+        client.table("sheets")
+        .select("sheet_number,storage_path")
+        .eq("job_id", job_id)
+        .order("sheet_number")
+        .execute().data
+    )
+    sheet_urls = [
+        {
+            "sheet_number": s["sheet_number"],
+            "url": _signed_url(s["storage_path"], SIGNED_URL_TTL_PREVIEW),
+        }
+        for s in sheets
     ]
+    return {"job": job, "sheets": sheet_urls}
 
-    response = run_make_stickers(
-        set_name=set_name,
-        total=state["total"],
-        sheet_filenames=sheet_filenames,
-        main_src=state["main_src"],
-        tab_src=state["tab_src"],
+
+def _get_my_job(client: Client, job_id: str, user_id: str) -> dict:
+    try:
+        UUID(job_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid job id")
+    resp = client.table("jobs").select("*").eq("id", job_id).single().execute()
+    job = resp.data
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job["user_id"] != user_id:
+        raise HTTPException(403, "Not your job")
+    return job
+
+
+# ---------- N8N 回呼：上傳單張 sheet ----------
+
+@app.post("/jobs/{job_id}/sheet")
+def upload_sheet(
+    job_id: str,
+    body: SheetUpload,
+    _=Depends(require_n8n_secret),
+):
+    client = _ensure_sb()
+    try:
+        UUID(job_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid job id")
+
+    job = client.table("jobs").select("*").eq("id", job_id).single().execute().data
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job["status"] not in ("generating", "pending"):
+        raise HTTPException(409, f"Job not accepting sheets (status={job['status']})")
+
+    try:
+        img_bytes = base64.b64decode(body.image_b64)
+    except Exception:
+        raise HTTPException(400, "image_b64 decode failed")
+
+    storage_path = f"{job['user_id']}/{job_id}/sheet_{body.sheet_number}.png"
+    _storage_upload(storage_path, img_bytes, "image/png")
+
+    client.table("sheets").upsert({
+        "job_id": job_id,
+        "sheet_number": body.sheet_number,
+        "storage_path": storage_path,
+    }, on_conflict="job_id,sheet_number").execute()
+
+    # 收齊就轉 review
+    received = client.table("sheets").select("sheet_number", count="exact").eq("job_id", job_id).execute()
+    received_count = received.count or 0
+    if received_count >= body.total_sheets:
+        client.table("jobs").update({"status": "review"}).eq("id", job_id).execute()
+
+    return {"ok": True, "received": received_count, "total_sheets": body.total_sheets}
+
+
+# ---------- 前端：finalize（確認裁切） ----------
+
+@app.post("/jobs/{job_id}/finalize")
+def finalize(job_id: str, user_id: str = Depends(require_user)):
+    client = _ensure_sb()
+    job = _get_my_job(client, job_id, user_id)
+    if job["status"] != "review":
+        raise HTTPException(409, f"Job status must be 'review' (got '{job['status']}')")
+
+    sheets = (
+        client.table("sheets")
+        .select("sheet_number,storage_path")
+        .eq("job_id", job_id)
+        .order("sheet_number")
+        .execute().data
     )
+    if not sheets:
+        raise HTTPException(400, "No sheets")
 
-    state["status"] = "finalized"
-    state["finalized_at"] = time.time()
-    save_state(set_name, state)
+    client.table("jobs").update({"status": "finalizing"}).eq("id", job_id).execute()
 
-    public = CONFIG.get("PUBLIC_URL") or "http://localhost:5000"
-    download_url = f"{public}/download/{set_name}.zip"
-    send_telegram(
-        f"「{set_name}」製作完成！\n"
-        f"共 {response['total']} 張貼圖 + main + tab\n\n"
-        f"下載 ZIP：\n{download_url}"
-    )
-    response["download_url"] = download_url
-    return JSONResponse(response)
+    try:
+        result = _run_cropping(job, sheets)
+    except Exception as e:
+        client.table("jobs").update({"status": "failed", "error": str(e)}).eq("id", job_id).execute()
+        raise
 
-@app.get("/download/{set_name}.zip")
-def download_zip(set_name: str):
-    zip_path = ZIP_PARENT / f"{set_name}.zip"
-    if not zip_path.exists():
-        raise HTTPException(404, "ZIP 不存在（可能還沒裁切完成）")
-    return FileResponse(zip_path, media_type="application/zip", filename=f"{set_name}.zip")
+    # 上傳 ZIP
+    zip_path = result["zip_path"]
+    zip_bytes = Path(zip_path).read_bytes()
+    zip_storage = f"{user_id}/{job_id}/{job['set_name']}.zip"
+    _storage_upload(zip_storage, zip_bytes, "application/zip")
 
-@app.post("/reject/{set_name}")
-def reject(set_name: str):
-    state = load_state(set_name)
-    if not state:
-        raise HTTPException(404, "Set not found")
-    for fname in state.get("sheet_filenames", {}).values():
-        p = GEMINI_DIR / fname
-        if p.exists():
-            p.unlink()
-    state_path(set_name).unlink(missing_ok=True)
-    send_telegram(f"「{set_name}」已退回，原稿已清除。請重新生圖。")
-    return {"status": "rejected", "set_name": set_name}
+    client.table("jobs").update({
+        "status": "done",
+        "zip_path": zip_storage,
+    }).eq("id", job_id).execute()
 
-# ============================================================
-# 舊端點（向下相容）
-# ============================================================
+    return {"ok": True, "zip_path": zip_storage, "files": result["files"]}
 
-@app.post("/process")
-def process_stickers(req: ProcessRequest):
-    GEMINI_DIR.mkdir(exist_ok=True)
+
+def _run_cropping(job: dict, sheets: List[dict]) -> dict:
+    """把 sheets 從 Supabase 下載到 /tmp → 呼叫 make_stickers.py → 回傳 zip 路徑"""
+    tmp = Path(tempfile.mkdtemp(prefix=f"job_{job['id'][:8]}_"))
+    gemini_dir = tmp / "gemini"
+    gemini_dir.mkdir(parents=True)
+
     sheet_filenames = []
-    for sheet in sorted(req.sheets, key=lambda s: s.number):
-        filename = f"{req.set_name}_sheet{sheet.number}.png"
-        filepath = GEMINI_DIR / filename
-        filepath.write_bytes(base64.b64decode(sheet.image_b64))
-        sheet_filenames.append(filename)
-        print(f"  儲存原稿：{filename}")
+    total_sheets = len(sheets)
+    for s in sheets:
+        fname = f"{job['set_name']}_sheet{s['sheet_number']}.png"
+        (gemini_dir / fname).write_bytes(_storage_download(s["storage_path"]))
+        sheet_filenames.append(fname)
 
-    response = run_make_stickers(
-        set_name=req.set_name,
-        total=req.total,
-        sheet_filenames=sheet_filenames,
-        main_src=req.main_src,
-        tab_src=req.tab_src,
+    # main/tab 取最後一張 sheet 的 0,1 格
+    main_sheet_idx = total_sheets - 1
+    cmd = [
+        sys.executable, str(MAKE_STICKERS),
+        "--name", job["set_name"],
+        "--total", str(job["total"]),
+        "--sheets", ",".join(sheet_filenames),
+        "--main", f"{main_sheet_idx},0",
+        "--tab", f"{main_sheet_idx},1",
+    ]
+    env = os.environ.copy()
+    env["DATA_DIR"] = str(tmp)
+    print(f"  跑 make_stickers: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(BASE_DIR), env=env)
+    if proc.returncode != 0:
+        # 清 tmp 再丟錯
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise HTTPException(500, {"stderr": proc.stderr, "stdout": proc.stdout})
+
+    out_dir = tmp / "完成圖檔區" / job["set_name"]
+    zip_path = tmp / "zip儲存區" / f"{job['set_name']}.zip"
+    files = sorted(f.name for f in out_dir.glob("*.png")) if out_dir.exists() else []
+
+    return {"zip_path": str(zip_path), "files": files, "tmp": str(tmp)}
+
+
+# ---------- 前端：reject / zip ----------
+
+@app.post("/jobs/{job_id}/reject")
+def reject(job_id: str, user_id: str = Depends(require_user)):
+    client = _ensure_sb()
+    job = _get_my_job(client, job_id, user_id)
+
+    # 刪 storage
+    sheets = (
+        client.table("sheets")
+        .select("storage_path")
+        .eq("job_id", job_id)
+        .execute().data
+    )
+    paths = [s["storage_path"] for s in sheets]
+    if job.get("reference_image_path"):
+        paths.append(job["reference_image_path"])
+    if paths:
+        _storage_remove(paths)
+
+    client.table("sheets").delete().eq("job_id", job_id).execute()
+    client.table("jobs").update({"status": "rejected"}).eq("id", job_id).execute()
+    return {"ok": True}
+
+
+@app.get("/jobs/{job_id}/zip")
+def download_zip(job_id: str, user_id: str = Depends(require_user)):
+    client = _ensure_sb()
+    job = _get_my_job(client, job_id, user_id)
+    if job["status"] != "done" or not job.get("zip_path"):
+        raise HTTPException(409, f"ZIP not ready (status={job['status']})")
+    url = _signed_url(job["zip_path"], SIGNED_URL_TTL_DOWNLOAD)
+    return {"url": url}
+
+
+# ---------- 內部：pg_cron 過期清除 ----------
+
+@app.post("/internal/cleanup")
+def cleanup(_=Depends(require_internal_token)):
+    client = _ensure_sb()
+    # 找過期 + 狀態還在 done/review 的 job
+    expired = (
+        client.table("jobs")
+        .select("id,user_id,reference_image_path,zip_path")
+        .lt("expires_at", "now()")
+        .in_("status", ["done", "review"])
+        .execute().data
     )
 
-    if req.callback_url:
-        try:
-            httpx.post(req.callback_url, json=response, timeout=10)
-        except Exception as e:
-            print(f"  回報 N8N 失敗：{e}")
+    removed = 0
+    for j in expired:
+        sheets = (
+            client.table("sheets")
+            .select("storage_path")
+            .eq("job_id", j["id"])
+            .execute().data
+        )
+        paths = [s["storage_path"] for s in sheets]
+        if j.get("reference_image_path"):
+            paths.append(j["reference_image_path"])
+        if j.get("zip_path"):
+            paths.append(j["zip_path"])
+        if paths:
+            _storage_remove(paths)
+            removed += len(paths)
+        client.table("sheets").delete().eq("job_id", j["id"]).execute()
 
-    return JSONResponse(response)
+    return {"ok": True, "jobs_expired": len(expired), "storage_objects_removed": removed}
+
 
 # ============================================================
 # 啟動
 # ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LINE 貼圖本機 Webhook Listener")
+    parser = argparse.ArgumentParser(description="LINE 貼圖後端（Supabase 版）")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
 
-    print(f"=== LINE 貼圖本機處理服務 ===")
+    print(f"=== LINE 貼圖後端（Supabase） ===")
     print(f"  監聽：http://{args.host}:{args.port}")
-    print(f"  PUBLIC_URL：{CONFIG.get('PUBLIC_URL') or '(未設定，審核連結會用 localhost)'}")
-    print(f"  Telegram：{'已設定' if (CONFIG.get('TG_BOT_TOKEN') and CONFIG.get('TG_CHAT_ID')) else '未設定'}")
-    print(f"  端點：")
-    print(f"    POST /sheet             （N8N 每張原稿 streaming 上傳）")
-    print(f"    GET  /preview/<name>    （瀏覽器審核頁）")
-    print(f"    POST /finalize/<name>   （確認裁切 + 打包）")
-    print(f"    POST /reject/<name>    （退回清除）")
-    print(f"    POST /process           （舊端點，向下相容）")
+    print(f"  SUPABASE_URL：{CONFIG.get('SUPABASE_URL') or '(未設定)'}")
+    print(f"  Supabase client：{'已連線' if sb else '未連線'}")
+    print(f"  N8N webhook：{CONFIG.get('N8N_WEBHOOK_URL') or '(未設定)'}")
+    print(f"  N8N secret：{'已設定' if CONFIG.get('N8N_SHARED_SECRET') else '未設定（任何請求都會被接受）'}")
+    print(f"  PUBLIC_URL：{CONFIG.get('PUBLIC_URL') or '(未設定)'}")
     print()
 
     uvicorn.run(app, host=args.host, port=args.port)
