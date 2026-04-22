@@ -525,6 +525,35 @@ def download_zip(job_id: str, user_id: str = Depends(require_user)):
     return {"url": url}
 
 
+# ---------- Admin：系列文案管理 ----------
+
+@app.get("/admin/series")
+def admin_list_series(user_id: str = Depends(require_user)):
+    client = _ensure_sb()
+    rows = (
+        client.table("series")
+        .select("id,name,items")
+        .order("id")
+        .execute().data
+    )
+    return {"series": rows}
+
+
+class SeriesItemsUpdate(BaseModel):
+    items: list
+
+
+@app.patch("/admin/series/{series_id}")
+def admin_update_series(
+    series_id: str,
+    body: SeriesItemsUpdate,
+    user_id: str = Depends(require_user),
+):
+    client = _ensure_sb()
+    client.table("series").update({"items": body.items}).eq("id", series_id).execute()
+    return {"ok": True, "count": len(body.items)}
+
+
 # ---------- 內部：pg_cron 過期清除 ----------
 
 @app.post("/internal/cleanup")
