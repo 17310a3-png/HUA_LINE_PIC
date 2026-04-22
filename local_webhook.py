@@ -44,6 +44,7 @@ import base64
 import io
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -278,6 +279,18 @@ def _trigger_n8n(job_id: str, user_id: str):
     # 參考圖 signed URL
     ref_url = _signed_url(job["reference_image_path"], SIGNED_URL_TTL_PREVIEW)
 
+    # 從系列池隨機抽 N 則（不放回），重新編號 idx。
+    # 讓同系列連續建兩組套組時，items 幾乎不重疊、角度/動作也會變化。
+    # 保留 idx=main / idx=tab 的特殊項目（封面 + Tab 小圖），不參與抽樣。
+    all_items = list(series["items"]) if series else []
+    specials = [it for it in all_items if str(it.get("idx")) in ("main", "tab")]
+    pool = [it for it in all_items if str(it.get("idx")) not in ("main", "tab")]
+    n = int(job["total"])
+    picked = random.sample(pool, min(n, len(pool))) if pool else []
+    for i, item in enumerate(picked, 1):
+        item["idx"] = f"{i:02d}"
+    picked.extend(specials)
+
     payload = {
         "job_id": job_id,
         "user_id": user_id,
@@ -286,7 +299,7 @@ def _trigger_n8n(job_id: str, user_id: str):
         "character_prompt": job["character_prompt"],
         "series_id": job["series_id"],
         "series_name": series["name"] if series else "",
-        "series_items": (series["items"] if series else []),
+        "series_items": picked,
         "total": job["total"],
         "model": job["model"],
         "reference_image_url": ref_url,
