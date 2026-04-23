@@ -61,6 +61,7 @@ from fastapi import (
     BackgroundTasks, Depends, FastAPI, File, Form, Header,
     HTTPException, UploadFile, status,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -109,6 +110,14 @@ if CONFIG.get("SUPABASE_URL") and CONFIG.get("SUPABASE_SERVICE_KEY"):
 
 
 app = FastAPI(title="LINE 貼圖後端服務（Supabase）")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https://.*\.zeabur\.app|http://localhost(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
