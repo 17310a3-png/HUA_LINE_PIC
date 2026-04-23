@@ -124,20 +124,54 @@ app.add_middleware(
 # Auth
 # ============================================================
 
+_JWKS_CLIENT: Optional[jwt.PyJWKClient] = None
+
+
+def _jwks_client() -> jwt.PyJWKClient:
+    """Supabase 新專案用非對稱 JWT（ES256/RS256）+ JWKS endpoint。"""
+    global _JWKS_CLIENT
+    if _JWKS_CLIENT is None:
+        base = CONFIG.get("SUPABASE_URL", "").rstrip("/")
+        if not base:
+            raise HTTPException(500, "Server missing SUPABASE_URL")
+        _JWKS_CLIENT = jwt.PyJWKClient(f"{base}/auth/v1/.well-known/jwks.json")
+    return _JWKS_CLIENT
+
+
 def require_user(authorization: Optional[str] = Header(None)) -> str:
-    """驗證 Supabase access token，回傳 user_id (sub)"""
+    """驗證 Supabase access token，回傳 user_id (sub)
+
+    先判斷 token header 的 alg：
+    - HS256 → 用 SUPABASE_JWT_SECRET（舊專案/legacy shared secret）
+    - ES256/RS256 → 抓 JWKS 取公鑰（新專案預設的非對稱金鑰）
+    """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
-    secret = CONFIG.get("SUPABASE_JWT_SECRET")
-    if not secret:
-        raise HTTPException(500, "Server missing SUPABASE_JWT_SECRET")
     try:
-        payload = jwt.decode(
-            token, secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
+        header = jwt.get_unverified_header(token)
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(401, f"Invalid token header: {e}")
+    alg = header.get("alg", "")
+    try:
+        if alg == "HS256":
+            secret = CONFIG.get("SUPABASE_JWT_SECRET")
+            if not secret:
+                raise HTTPException(500, "Server missing SUPABASE_JWT_SECRET")
+            payload = jwt.decode(
+                token, secret,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+        elif alg in ("ES256", "RS256"):
+            signing_key = _jwks_client().get_signing_key_from_jwt(token)
+            payload = jwt.decode(
+                token, signing_key.key,
+                algorithms=[alg],
+                audience="authenticated",
+            )
+        else:
+            raise HTTPException(401, f"Invalid token: alg {alg!r} not allowed")
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError as e:

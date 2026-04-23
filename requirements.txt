@@ -5,5 +5,5 @@ Pillow>=10.0
 numpy>=1.26
 pydantic>=2.6
 supabase>=2.3
-PyJWT>=2.8
+PyJWT[crypto]>=2.8
 python-multipart>=0.0.9
